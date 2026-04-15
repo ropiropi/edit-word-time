@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Word 総編集時間 + 日時整合ツール（更新日時指定対応）</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+        body { font-family: sans-serif; text-align: center; padding: 40px; background: #f4f4f4; line-height: 1.6; }
+        #dropzone {
+            border: 4px dashed #0066ff;
+            padding: 70px;
+            margin: 30px auto;
+            max-width: 600px;
+            background: white;
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 18px;
+        }
+        #dropzone.dragover { background: #e0f0ff; border-color: #00aa00; }
+        .info { margin: 20px auto; padding: 15px; background: #fff; border-radius: 8px; max-width: 650px; text-align: left; border: 1px solid #ddd; }
+        .option, .setting { margin: 15px 0; }
+        input, button, select { padding: 10px 15px; font-size: 16px; margin: 5px; }
+        #status, #currentInfo, #previewInfo { margin-top: 15px; font-weight: bold; }
+        .random-result { margin: 15px 0; padding: 15px; background: #e8f5e8; border-radius: 8px; font-size: 17px; display: none; }
+        button { cursor: pointer; }
+        .usage { max-width: 650px; margin: 20px auto; padding: 15px; background: #fff3cd; border-radius: 8px; text-align: left; font-size: 15px; }
+    </style>
+</head>
+<body>
+    <h1>Word 総編集時間 + 作成/更新日時 整合ツール</h1>
+
+    <div class="usage">
+        <strong>簡単な使い方：</strong><br>
+        1. .docxファイルをここにドラッグ＆ドロップ（現在のメタデータが即表示されます）<br>
+        2. 総編集時間を固定値または範囲で指定<br>
+        3. 作成日時の余裕範囲（最小・最大）と更新日時（任意指定 or 元のまま）を設定<br>
+        4. 「仮決定」ボタンを押してプレビューを確認<br>
+        5. OKなら「書き換えてダウンロード」をクリック
+    </div>
+
+    <div id="dropzone">ここに .docx ファイルをドロップ<br>またはクリックして選択</div>
+    <input type="file" id="fileInput" accept=".docx" style="display:none;">
+
+    <!-- 現在のファイル情報 -->
+    <div id="currentInfo" class="info" style="display:none;">
+        <strong>現在のファイル情報:</strong><br>
+        <span id="fileNameDisplay"></span><br>
+        総編集時間: <span id="currentTotalTime"></span><br>
+        作成日時: <span id="currentCreated"></span><br>
+        更新日時: <span id="currentModified"></span>
+    </div>
+
+    <!-- モード選択 -->
+    <div class="option">
+        <label><input type="radio" name="mode" value="fixed" checked> 固定値で指定</label>
+        <label><input type="radio" name="mode" value="range"> 範囲内でランダム</label>
+    </div>
+
+    <!-- 作成日時の範囲指定（両モード共通） -->
+    <div class="setting">
+        <label>作成日時の余裕範囲：
+            <input type="number" id="minMarginHours" value="3" min="0" style="width:70px;"> 時間以上前 ～ 
+            <input type="number" id="maxMarginHours" value="24" min="0" style="width:70px;"> 時間以内前
+        </label>
+    </div>
+
+    <!-- 更新日時の指定 -->
+    <div class="setting">
+        <label>
+            <input type="checkbox" id="keepOriginalModified" checked> 更新日時を指定しない（元の更新日時を保持）
+        </label><br>
+        <label id="customModifiedLabel" style="display:none;">
+            更新日時を指定：
+            <input type="datetime-local" id="customModified" style="width:280px;">
+        </label>
+    </div>
+
+    <!-- 固定モード -->
+    <div id="fixedPanel">
+        <label>総編集時間：
+            <input type="number" id="hours" value="2" min="0" style="width:60px;"> 時間 
+            <input type="number" id="minutes" value="30" min="0" max="59" style="width:60px;"> 分 
+            <input type="number" id="seconds" value="0" min="0" max="59" style="width:60px;"> 秒
+        </label>
+        <button onclick="decideProvisionalTime()" style="background:#0066ff; color:white; border:none; border-radius:6px;">
+            仮決定
+        </button>
+    </div>
+
+    <!-- 範囲モード -->
+    <div id="rangePanel" style="display:none;">
+        <label>最小： <input type="number" id="minMinutes" value="300" min="0" style="width:80px;"> 分</label>
+        <label>最大： <input type="number" id="maxMinutes" value="720" min="0" style="width:80px;"> 分</label>
+        <button onclick="decideProvisionalTime()" style="background:#0066ff; color:white; border:none; border-radius:6px;">
+            仮決定（ランダム）
+        </button>
+    </div>
+
+    <!-- 仮決定プレビュー -->
+    <div id="randomResult" class="random-result"></div>
+    <div id="previewInfo" class="info" style="display:none;"></div>
+
+    <button onclick="processFile()" style="font-size:18px; padding:12px 40px; margin-top:20px;">
+        書き換えてダウンロード
+    </button>
+
+    <div id="status"></div>
+
+    <script>
+        let currentZip = null;
+        let currentFileName = '';
+        let decidedTotalMinutes = null;
+        let originalModifiedStr = null;  // 元の更新日時文字列
+
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('fileInput');
+        const statusEl = document.getElementById('status');
+        const currentInfoEl = document.getElementById('currentInfo');
+        const randomResultEl = document.getElementById('randomResult');
+        const previewInfoEl = document.getElementById('previewInfo');
+        const keepModifiedCheck = document.getElementById('keepOriginalModified');
+        const customModifiedLabel = document.getElementById('customModifiedLabel');
+        const customModifiedInput = document.getElementById('customModified');
+
+        // 更新日時指定のチェックボックス切り替え
+        keepModifiedCheck.addEventListener('change', () => {
+            customModifiedLabel.style.display = keepModifiedCheck.checked ? 'none' : 'block';
+        });
+
+        // モード切り替え
+        document.querySelectorAll('input[name="mode"]').forEach(radio => {
+            radio.addEventListener('change', () => {
+                const isRange = radio.value === 'range';
+                document.getElementById('fixedPanel').style.display = isRange ? 'none' : 'block';
+                document.getElementById('rangePanel').style.display = isRange ? 'block' : 'none';
+                randomResultEl.style.display = 'none';
+                previewInfoEl.style.display = 'none';
+                decidedTotalMinutes = null;
+            });
+        });
+
+        // ドラッグ＆ドロップ
+        dropzone.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', e => handleFile(e.target.files[0]));
+        dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+        dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+        dropzone.addEventListener('drop', e => {
+            e.preventDefault();
+            dropzone.classList.remove('dragover');
+            if (e.dataTransfer.files.length > 0) handleFile(e.dataTransfer.files[0]);
+        });
+
+        async function handleFile(file) {
+            if (!file || !file.name.endsWith('.docx')) {
+                alert('.docxファイルのみ対応しています');
+                return;
+            }
+            currentFileName = file.name;
+            statusEl.textContent = `読み込み中: ${file.name} ...`;
+
+            const reader = new FileReader();
+            reader.onload = async (event) => {
+                try {
+                    currentZip = await JSZip.loadAsync(event.target.result);
+
+                    let totalTimeStr = '不明';
+                    let createdStr = '不明';
+                    let modifiedStr = '不明';
+
+                    const appXmlFile = currentZip.file('docProps/app.xml');
+                    if (appXmlFile) {
+                        const appXml = await appXmlFile.async('string');
+                        const match = appXml.match(/<TotalTime>(\d+)<\/TotalTime>/);
+                        if (match) {
+                            const minutes = parseInt(match[1]);
+                            const h = Math.floor(minutes / 60);
+                            const m = minutes % 60;
+                            totalTimeStr = `${h}時間 ${m}分 (${minutes}分)`;
+                        }
+                    }
+
+                    const coreXmlFile = currentZip.file('docProps/core.xml');
+                    if (coreXmlFile) {
+                        const coreXml = await coreXmlFile.async('string');
+                        const createdMatch = coreXml.match(/<dcterms:created[^>]*>([^<]+)<\/dcterms:created>/);
+                        const modifiedMatch = coreXml.match(/<dcterms:modified[^>]*>([^<]+)<\/dcterms:modified>/);
+                        
+                        if (createdMatch) createdStr = new Date(createdMatch[1]).toLocaleString('ja-JP');
+                        if (modifiedMatch) {
+                            modifiedStr = new Date(modifiedMatch[1]).toLocaleString('ja-JP');
+                            originalModifiedStr = modifiedMatch[1];
+                        }
+                    }
+
+                    document.getElementById('fileNameDisplay').textContent = `ファイル名: ${currentFileName}`;
+                    document.getElementById('currentTotalTime').innerHTML = totalTimeStr;
+                    document.getElementById('currentCreated').textContent = createdStr;
+                    document.getElementById('currentModified').textContent = modifiedStr;
+                    currentInfoEl.style.display = 'block';
+
+                    statusEl.textContent = `${currentFileName} を読み込みました。設定して「仮決定」を押してください。`;
+                } catch (err) {
+                    statusEl.textContent = '読み込み失敗: ' + err.message;
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        }
+
+        // 仮決定ボタン
+        function decideProvisionalTime() {
+            const isRange = document.querySelector('input[name="mode"]:checked').value === 'range';
+            let totalMinutes = 0;
+            let displaySeconds = 0;
+
+            if (isRange) {
+                const minM = parseInt(document.getElementById('minMinutes').value) || 0;
+                let maxM = parseInt(document.getElementById('maxMinutes').value) || minM;
+                if (maxM < minM) maxM = minM;
+                totalMinutes = Math.floor(Math.random() * (maxM - minM + 1)) + minM;
+                displaySeconds = Math.floor(Math.random() * 60);
+            } else {
+                const h = parseInt(document.getElementById('hours').value) || 0;
+                const m = parseInt(document.getElementById('minutes').value) || 0;
+                const s = parseInt(document.getElementById('seconds').value) || 0;
+                totalMinutes = h * 60 + m + Math.floor(s / 60);
+                displaySeconds = s % 60;
+            }
+
+            decidedTotalMinutes = totalMinutes;
+
+            const minMarginH = parseInt(document.getElementById('minMarginHours').value) || 0;
+            const maxMarginH = parseInt(document.getElementById('maxMarginHours').value) || minMarginH + 1;
+            const actualMarginH = Math.floor(Math.random() * (maxMarginH - minMarginH + 1)) + minMarginH;
+
+            const now = new Date();
+            const createdTime = new Date(now.getTime() - (totalMinutes + actualMarginH * 60) * 60000);
+
+            let modifiedTime;
+            if (keepModifiedCheck.checked && originalModifiedStr) {
+                modifiedTime = new Date(originalModifiedStr);
+            } else {
+                const customDate = customModifiedInput.value ? new Date(customModifiedInput.value) : now;
+                modifiedTime = new Date(customDate.getTime() - Math.floor(Math.random() * 11) * 60000);
+            }
+
+            const displayHours = Math.floor(totalMinutes / 60);
+            const displayMin = totalMinutes % 60;
+
+            randomResultEl.innerHTML = `
+                <strong>仮決定：</strong> ${displayHours}時間 ${displayMin}分 ${displaySeconds}秒<br>
+                作成日時余裕: ${actualMarginH}時間前
+            `;
+            randomResultEl.style.display = 'block';
+
+            previewInfoEl.innerHTML = `
+                <strong>仮の作成日時：</strong> ${createdTime.toLocaleString('ja-JP')}<br>
+                <strong>仮の更新日時：</strong> ${modifiedTime.toLocaleString('ja-JP')}<br>
+                <small>（作成日時は指定範囲内で調整済み / 更新日時は${keepModifiedCheck.checked ? '元の値を保持' : '指定値を使用'}）</small>
+            `;
+            previewInfoEl.style.display = 'block';
+
+            statusEl.textContent = `仮決定完了: ${displayHours}時間 ${displayMin}分 ${displaySeconds}秒`;
+        }
+
+        // ダウンロード処理
+        async function processFile() {
+            if (!currentZip) {
+                alert('まずWordファイルをドラッグ＆ドロップしてください');
+                return;
+            }
+
+            let totalMinutes = decidedTotalMinutes !== null ? decidedTotalMinutes : 0;
+            let extraSeconds = Math.floor(Math.random() * 60);
+
+            if (totalMinutes === 0 && document.querySelector('input[name="mode"]:checked').value === 'fixed') {
+                const h = parseInt(document.getElementById('hours').value) || 0;
+                const m = parseInt(document.getElementById('minutes').value) || 0;
+                const s = parseInt(document.getElementById('seconds').value) || 0;
+                totalMinutes = h * 60 + m + Math.floor(s / 60);
+                extraSeconds = s % 60;
+            }
+
+            const minMarginH = parseInt(document.getElementById('minMarginHours').value) || 0;
+            const maxMarginH = parseInt(document.getElementById('maxMarginHours').value) || minMarginH + 1;
+            const actualMarginH = Math.floor(Math.random() * (maxMarginH - minMarginH + 1)) + minMarginH;
+
+            statusEl.textContent = `調整中...`;
+
+            try {
+                // TotalTime 更新
+                const appXmlFile = currentZip.file('docProps/app.xml');
+                if (appXmlFile) {
+                    let appXml = await appXmlFile.async('string');
+                    if (/<TotalTime>\d+<\/TotalTime>/.test(appXml)) {
+                        appXml = appXml.replace(/<TotalTime>\d+<\/TotalTime>/, `<TotalTime>${totalMinutes}</TotalTime>`);
+                    } else {
+                        appXml = appXml.replace(/<\/Properties>/, `<TotalTime>${totalMinutes}</TotalTime></Properties>`);
+                    }
+                    currentZip.file('docProps/app.xml', appXml);
+                }
+
+                // core.xml 更新
+                const coreXmlFile = currentZip.file('docProps/core.xml');
+                if (coreXmlFile) {
+                    let coreXml = await coreXmlFile.async('string');
+                    const now = new Date();
+                    const createdTime = new Date(now.getTime() - (totalMinutes + actualMarginH * 60) * 60000);
+
+                    let modifiedTime;
+                    if (keepModifiedCheck.checked && originalModifiedStr) {
+                        modifiedTime = new Date(originalModifiedStr);
+                    } else {
+                        const customDate = customModifiedInput.value ? new Date(customModifiedInput.value) : now;
+                        modifiedTime = new Date(customDate.getTime() - Math.floor(Math.random() * 11) * 60000);
+                    }
+
+                    const createdStr = createdTime.toISOString().replace(/\.\d{3}Z$/, 'Z');
+                    const modifiedStr = modifiedTime.toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+                    coreXml = coreXml.replace(/<dcterms:created[^>]*>.*?<\/dcterms:created>/, `<dcterms:created xsi:type="dcterms:W3CDTF">${createdStr}</dcterms:created>`);
+                    coreXml = coreXml.replace(/<dcterms:modified[^>]*>.*?<\/dcterms:modified>/, `<dcterms:modified xsi:type="dcterms:W3CDTF">${modifiedStr}</dcterms:modified>`);
+
+                    currentZip.file('docProps/core.xml', coreXml);
+                }
+
+                const newBlob = await currentZip.generateAsync({type: 'blob'});
+                const url = URL.createObjectURL(newBlob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'modified_' + currentFileName;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+
+                const displayHours = Math.floor(totalMinutes / 60);
+                const displayMin = totalMinutes % 60;
+                statusEl.innerHTML = `完了！<br>総編集時間 <strong>${displayHours}時間 ${displayMin}分 ${extraSeconds}秒</strong><br>作成日時・更新日時を指定通りに調整しました`;
+            } catch (err) {
+                statusEl.textContent = 'エラー: ' + err.message;
+                console.error(err);
+            }
+        }
+    </script>
+</body>
+</html>
